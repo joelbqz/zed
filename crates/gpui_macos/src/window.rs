@@ -1098,13 +1098,20 @@ impl MacWindow {
                 cursor_style: CursorStyle::Arrow,
                 cursor_visible,
                 frame_source: None,
-                renderer: renderer::new_renderer(
-                    renderer_context,
-                    native_window as *mut _,
-                    native_view as *mut _,
-                    bounds.size.map(|pixels| pixels.as_f32()),
-                    false,
-                ),
+                renderer: {
+                    let mut renderer = renderer::new_renderer(
+                        renderer_context,
+                        native_window as *mut _,
+                        native_view as *mut _,
+                        bounds.size.map(|pixels| pixels.as_f32()),
+                        false,
+                    );
+                    // Present every frame in the Core Animation transaction it was drawn in,
+                    // so native views moved while drawing it (web views, controls) reach the
+                    // screen together with it rather than a frame apart.
+                    renderer.set_presents_with_transaction(true);
+                    renderer
+                },
                 request_frame_callback: None,
                 event_callback: None,
                 activate_callback: None,
@@ -3166,14 +3173,12 @@ extern "C" fn window_did_change_key_status(this: &Object, selector: Sel, _: id) 
 
         if lock.activated_least_once {
             if let Some(mut callback) = lock.request_frame_callback.take() {
-                lock.renderer.set_presents_with_transaction(true);
                 lock.stop_display_link();
                 drop(lock);
                 callback(Default::default());
 
                 let mut lock = window_state.lock();
                 lock.request_frame_callback = Some(callback);
-                lock.renderer.set_presents_with_transaction(false);
                 lock.start_display_link();
             }
         } else {
@@ -3287,14 +3292,12 @@ extern "C" fn display_layer(this: &Object, _: Sel, _: id) {
     let window_state = unsafe { get_window_state(this) };
     let mut lock = window_state.lock();
     if let Some(mut callback) = lock.request_frame_callback.take() {
-        lock.renderer.set_presents_with_transaction(true);
         lock.stop_display_link();
         drop(lock);
         callback(Default::default());
 
         let mut lock = window_state.lock();
         lock.request_frame_callback = Some(callback);
-        lock.renderer.set_presents_with_transaction(false);
         lock.start_display_link();
     }
 }
