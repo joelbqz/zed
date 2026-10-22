@@ -19,10 +19,11 @@ use crate::{
     SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
     StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
     SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextInputConfiguration,
-    TextInputStateChange, TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState,
-    TransformationMatrix, Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance,
-    WindowBounds, WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem,
-    WindowVisibility, point, prelude::*, px, rems, size, transparent_black,
+    TextInputStateChange, TextRenderingMode, TextStyle, TextStyleRefinement, TextureBuilder,
+    ThermalState, TransformationMatrix, Underline, UnderlineStyle, WindowAppearance,
+    WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations, WindowOptions,
+    WindowParams, WindowTextSystem, WindowVisibility, point, prelude::*, px, rems, size,
+    transparent_black,
 };
 
 use crate::gestures::{GestureTuning, RecognizedTouchGesture, TouchGestureRecognizer};
@@ -4892,18 +4893,28 @@ impl Window {
             frame_index,
         };
 
-        let tile = self
-            .sprite_atlas
-            .get_or_insert_with(params.into(), &mut || {
-                Ok(Some((
-                    data.size(frame_index),
-                    Cow::Borrowed(
-                        data.as_bytes(frame_index)
-                            .expect("It's the caller's job to pass a valid frame index"),
-                    ),
-                )))
-            })?
-            .expect("Callback above only returns Some");
+        // Made into a texture already: it goes in as it is.
+        let prebuilt = match data.take_texture(frame_index) {
+            Some(texture) => self
+                .sprite_atlas
+                .insert_built(params.clone().into(), texture)?,
+            None => None,
+        };
+        let tile = match prebuilt {
+            Some(tile) => tile,
+            None => self
+                .sprite_atlas
+                .get_or_insert_with(params.into(), &mut || {
+                    Ok(Some((
+                        data.size(frame_index),
+                        Cow::Borrowed(
+                            data.as_bytes(frame_index)
+                                .expect("It's the caller's job to pass a valid frame index"),
+                        ),
+                    )))
+                })?
+                .expect("Callback above only returns Some"),
+        };
 
         let visible_bounds_snapped = self.snap_bounds(visible_bounds);
 
@@ -4983,6 +4994,13 @@ impl Window {
             content_mask,
             image_buffer,
         });
+    }
+
+    /// Something that makes images into textures for this window's atlas on any thread, so
+    /// big ones needn't be copied there on the main thread (see
+    /// [`RenderImage::with_texture`]). `None` where the platform can't.
+    pub fn texture_builder(&self) -> Option<Arc<dyn TextureBuilder>> {
+        self.sprite_atlas.texture_builder()
     }
 
     /// Removes an image from the sprite atlas.

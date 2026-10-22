@@ -1422,6 +1422,17 @@ impl From<RenderImageParams> for AtlasKey {
     }
 }
 
+/// Makes images into GPU textures of their own on any thread, so a big one can go into a
+/// window's sprite atlas without its pixels being copied there on the main thread as it's
+/// first painted (see [`RenderImage::with_texture`]).
+pub trait TextureBuilder: Send + Sync {
+    /// A texture holding `bytes` (BGRA, `size`), or `None` if one can't be made.
+    fn build(&self, size: Size<DevicePixels>, bytes: &[u8]) -> Option<BuiltTexture>;
+}
+
+/// A texture made by a [`TextureBuilder`], for the atlas it came from.
+pub struct BuiltTexture(pub Box<dyn std::any::Any + Send + Sync>);
+
 #[expect(missing_docs)]
 pub trait PlatformAtlas {
     /// The builder runs with the atlas locked and must not re-enter the same atlas.
@@ -1431,6 +1442,18 @@ pub trait PlatformAtlas {
         build: &mut dyn FnMut() -> Result<Option<(Size<DevicePixels>, Cow<'a, [u8]>)>>,
     ) -> Result<Option<AtlasTile>>;
     fn remove(&self, key: &AtlasKey);
+
+    /// Something that makes textures for this atlas off the main thread, where it can.
+    fn texture_builder(&self) -> Option<Arc<dyn TextureBuilder>> {
+        None
+    }
+
+    /// Put a texture from [`texture_builder`](Self::texture_builder) in the atlas under
+    /// `key`, as a page of its own, without copying its pixels. `None` when it can't take
+    /// it, and the pixels have to be uploaded instead.
+    fn insert_built(&self, _key: AtlasKey, _texture: BuiltTexture) -> Result<Option<AtlasTile>> {
+        Ok(None)
+    }
 
     #[cfg(any(test, feature = "test-support", feature = "bench-support"))]
     fn contains(&self, _key: &AtlasKey) -> bool {
@@ -1506,6 +1529,23 @@ impl<Backend: AtlasBackend> AtlasState<Backend> {
         if let Some(tile) = self.tiles_by_key.remove(key) {
             self.backend.remove(tile);
         }
+    }
+
+    /// The tile for `key`, put there by `insert` (a texture built elsewhere) if it's
+    /// missing.
+    pub fn insert_built(
+        &mut self,
+        key: AtlasKey,
+        insert: impl FnOnce(&mut Backend) -> Result<Option<AtlasTile>>,
+    ) -> Result<Option<AtlasTile>> {
+        if let Some(tile) = self.tiles_by_key.get(&key) {
+            return Ok(Some(*tile));
+        }
+        let Some(tile) = insert(&mut self.backend)? else {
+            return Ok(None);
+        };
+        self.tiles_by_key.insert(key, tile);
+        Ok(Some(tile))
     }
 }
 

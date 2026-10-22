@@ -1,4 +1,4 @@
-use crate::{DevicePixels, Pixels, Result, SharedString, Size, size};
+use crate::{BuiltTexture, DevicePixels, Pixels, Result, SharedString, Size, size};
 use smallvec::SmallVec;
 
 use image::{Delay, Frame};
@@ -46,6 +46,8 @@ pub struct RenderImage {
     /// The scale factor of this image on render.
     pub(crate) scale_factor: f32,
     data: SmallVec<[Frame; 1]>,
+    /// Its first frame made into a texture already, until it's first painted.
+    texture: parking_lot::Mutex<Option<BuiltTexture>>,
 }
 
 impl PartialEq for RenderImage {
@@ -65,7 +67,27 @@ impl RenderImage {
             id: ImageId(NEXT_ID.fetch_add(1, SeqCst)),
             scale_factor: 1.0,
             data: data.into(),
+            texture: parking_lot::Mutex::new(None),
         }
+    }
+
+    /// This image, its first frame already made into `texture` (by the window's
+    /// [`TextureBuilder`](crate::TextureBuilder), on any thread), which goes into the sprite
+    /// atlas as it is when it's first painted rather than having its pixels copied there.
+    pub fn with_texture(self, texture: BuiltTexture) -> Self {
+        *self.texture.lock() = Some(texture);
+        self
+    }
+
+    /// Whether it has a texture made for it that it hasn't been painted with yet.
+    pub fn has_texture(&self) -> bool {
+        self.texture.lock().is_some()
+    }
+
+    pub(crate) fn take_texture(&self, frame_index: usize) -> Option<BuiltTexture> {
+        (frame_index == 0)
+            .then(|| self.texture.lock().take())
+            .flatten()
     }
 
     /// Convert this image into a byte slice.
