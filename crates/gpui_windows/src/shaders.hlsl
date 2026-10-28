@@ -125,6 +125,27 @@ float4 distance_from_clip_rect_transformed(float2 unit_vertex, Bounds bounds, Bo
     return distance_from_clip_rect_impl(transformed, clip_bounds);
 }
 
+// Whether a transformation turns what it's applied to, so its edges no longer run along
+// the pixel grid.
+bool is_turned(TransformationMatrix transformation) {
+    return transformation.rotation_scale._12 != 0.0 || transformation.rotation_scale._21 != 0.0;
+}
+
+// A corner of the unit square, moved a pixel further out from the bounds on each side,
+// for a turned quad to have room to smooth its edges.
+float2 outset_unit_vertex(float2 unit_vertex, Bounds bounds) {
+    return (unit_vertex * (bounds.size + 2.0) - 1.0) / bounds.size;
+}
+
+// Where a point after the transformation was before it: the inverse transformation. Exact
+// for the unit transformation.
+float2 untransformed_position(float2 position, TransformationMatrix transformation) {
+    float2x2 m = transformation.rotation_scale;
+    float2 moved = position - transformation.translation;
+    float2x2 inverse = float2x2(m._22, -m._12, -m._21, m._11) / determinant(m);
+    return mul(moved, inverse);
+}
+
 // Convert linear RGB to sRGB
 float3 linear_to_srgb(float3 color) {
     return pow(color, float3(1.0 / 2.2, 1.0 / 2.2, 1.0 / 2.2));
@@ -1219,6 +1240,7 @@ struct PolychromeSprite {
     Bounds content_mask;
     Corners corner_radii;
     AtlasTile tile;
+    TransformationMatrix transformation;
 };
 
 struct PolychromeSpriteVertexOutput {
@@ -1240,9 +1262,13 @@ PolychromeSpriteVertexOutput polychrome_sprite_vertex(uint vertex_id: SV_VertexI
     float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
     uint sprite_id = batch_start_index + instance_id;
     PolychromeSprite sprite = poly_sprites[sprite_id];
-    float4 device_position = to_device_position(unit_vertex, sprite.bounds);
-    float4 clip_distance = distance_from_clip_rect(unit_vertex, sprite.bounds,
-                                                    sprite.content_mask);
+    if (is_turned(sprite.transformation)) {
+        unit_vertex = outset_unit_vertex(unit_vertex, sprite.bounds);
+    }
+    float4 device_position =
+        to_device_position_transformed(unit_vertex, sprite.bounds, sprite.transformation);
+    float4 clip_distance = distance_from_clip_rect_transformed(unit_vertex, sprite.bounds,
+                                                               sprite.content_mask, sprite.transformation);
     float2 tile_position = to_tile_position(unit_vertex, sprite.tile);
 
     PolychromeSpriteVertexOutput output;
@@ -1255,8 +1281,21 @@ PolychromeSpriteVertexOutput polychrome_sprite_vertex(uint vertex_id: SV_VertexI
 
 float4 polychrome_sprite_fragment(PolychromeSpriteFragmentInput input): SV_Target {
     PolychromeSprite sprite = poly_sprites[input.sprite_id];
-    float4 sample = t_sprite.Sample(s_sprite, input.tile_position);
-    float distance = quad_sdf(input.position.xy, sprite.bounds, sprite.corner_radii);
+    float2 tile_position = input.tile_position;
+    if (is_turned(sprite.transformation)) {
+        // The quad reaches past the tile, and past the tile's edge texels lie its neighbors
+        // in the atlas.
+        float2 atlas_size;
+        t_sprite.GetDimensions(atlas_size.x, atlas_size.y);
+        float2 tile_origin = float2(sprite.tile.bounds.origin);
+        float2 tile_size = float2(sprite.tile.bounds.size);
+        tile_position = clamp(tile_position, (tile_origin + 0.5) / atlas_size,
+                              (tile_origin + tile_size - 0.5) / atlas_size);
+    }
+    float4 sample = t_sprite.Sample(s_sprite, tile_position);
+    // Corners are rounded in the sprite's own space, before it's transformed.
+    float2 position = untransformed_position(input.position.xy, sprite.transformation);
+    float distance = quad_sdf(position, sprite.bounds, sprite.corner_radii);
 
     float4 color = sample;
     if (sprite.grayscale != 0u) {

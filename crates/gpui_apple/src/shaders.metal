@@ -20,6 +20,9 @@ float4 distance_from_clip_rect(float2 unit_vertex, Bounds_ScaledPixels bounds,
                                Bounds_ScaledPixels clip_bounds);
 float4 distance_from_clip_rect_transformed(float2 unit_vertex, Bounds_ScaledPixels bounds,
                                Bounds_ScaledPixels clip_bounds, TransformationMatrix transformation);
+float2 untransformed_position(float2 position, TransformationMatrix transformation);
+bool is_turned(TransformationMatrix transformation);
+float2 outset_unit_vertex(float2 unit_vertex, Bounds_ScaledPixels bounds);
 float corner_dash_velocity(float dv1, float dv2);
 float dash_alpha(float t, float period, float length, float dash_velocity,
                  float antialias_threshold);
@@ -696,10 +699,13 @@ vertex PolychromeSpriteVertexOutput polychrome_sprite_vertex(
 
   float2 unit_vertex = unit_vertices[unit_vertex_id];
   PolychromeSprite sprite = sprites[sprite_id];
+  if (is_turned(sprite.transformation)) {
+    unit_vertex = outset_unit_vertex(unit_vertex, sprite.bounds);
+  }
   float4 device_position =
-      to_device_position(unit_vertex, sprite.bounds, viewport_size);
-  float4 clip_distance = distance_from_clip_rect(unit_vertex, sprite.bounds,
-                                                 sprite.content_mask.bounds);
+      to_device_position_transformed(unit_vertex, sprite.bounds, sprite.transformation, viewport_size);
+  float4 clip_distance = distance_from_clip_rect_transformed(unit_vertex, sprite.bounds,
+                                                 sprite.content_mask.bounds, sprite.transformation);
   float2 tile_position = to_tile_position(unit_vertex, sprite.tile, atlas_size);
   return PolychromeSpriteVertexOutput{
       device_position,
@@ -715,10 +721,20 @@ fragment float4 polychrome_sprite_fragment(
   PolychromeSprite sprite = sprites[input.sprite_id];
   constexpr sampler atlas_texture_sampler(mag_filter::linear,
                                           min_filter::linear);
-  float4 sample =
-      atlas_texture.sample(atlas_texture_sampler, input.tile_position);
-  float distance =
-      quad_sdf(input.position.xy, sprite.bounds, sprite.corner_radii);
+  float2 tile_position = input.tile_position;
+  if (is_turned(sprite.transformation)) {
+    // The quad reaches past the tile, and past the tile's edge texels lie its neighbors
+    // in the atlas.
+    float2 atlas_size = float2(atlas_texture.get_width(), atlas_texture.get_height());
+    float2 tile_origin = float2(sprite.tile.bounds.origin.x, sprite.tile.bounds.origin.y);
+    float2 tile_size = float2(sprite.tile.bounds.size.width, sprite.tile.bounds.size.height);
+    tile_position = clamp(tile_position, (tile_origin + 0.5) / atlas_size,
+                          (tile_origin + tile_size - 0.5) / atlas_size);
+  }
+  float4 sample = atlas_texture.sample(atlas_texture_sampler, tile_position);
+  // Corners are rounded in the sprite's own space, before it's transformed.
+  float2 position = untransformed_position(input.position.xy, sprite.transformation);
+  float distance = quad_sdf(position, sprite.bounds, sprite.corner_radii);
 
   float4 color = sample;
   if (sprite.grayscale) {
@@ -850,12 +866,15 @@ fragment float4 path_sprite_fragment(
 struct SurfaceVertexOutput {
   float4 position [[position]];
   float2 texture_position;
+  // The surface's size if it's turned, for smoothing its edges; zero if not.
+  float2 turned_size [[flat]];
   float clip_distance [[clip_distance]][4];
 };
 
 struct SurfaceFragmentInput {
   float4 position [[position]];
   float2 texture_position;
+  float2 turned_size [[flat]];
 };
 
 vertex SurfaceVertexOutput surface_vertex(
@@ -868,16 +887,22 @@ vertex SurfaceVertexOutput surface_vertex(
     [[buffer(SurfaceInputIndex_TextureSize)]]) {
   float2 unit_vertex = unit_vertices[unit_vertex_id];
   SurfaceBounds surface = surfaces[surface_id];
+  float2 turned_size = float2(0.);
+  if (is_turned(surface.transformation)) {
+    unit_vertex = outset_unit_vertex(unit_vertex, surface.bounds);
+    turned_size = float2(surface.bounds.size.width, surface.bounds.size.height);
+  }
   float4 device_position =
-      to_device_position(unit_vertex, surface.bounds, viewport_size);
-  float4 clip_distance = distance_from_clip_rect(unit_vertex, surface.bounds,
-                                                 surface.content_mask.bounds);
+      to_device_position_transformed(unit_vertex, surface.bounds, surface.transformation, viewport_size);
+  float4 clip_distance = distance_from_clip_rect_transformed(unit_vertex, surface.bounds,
+                                                 surface.content_mask.bounds, surface.transformation);
   // We are going to copy the whole texture, so the texture position corresponds
   // to the current vertex of the unit triangle.
   float2 texture_position = unit_vertex;
   return SurfaceVertexOutput{
       device_position,
       texture_position,
+      turned_size,
       {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
 }
 
@@ -896,7 +921,14 @@ fragment float4 surface_fragment(SurfaceFragmentInput input [[stage_in]],
       y_texture.sample(texture_sampler, input.texture_position).r,
       cb_cr_texture.sample(texture_sampler, input.texture_position).rg, 1.0);
 
-  return ycbcrToRGBTransform * ycbcr;
+  float4 color = ycbcrToRGBTransform * ycbcr;
+  // A turned surface's quad reaches a pixel past its edges, to smooth them.
+  if (input.turned_size.x > 0.) {
+    float2 outside =
+        max(-input.texture_position, input.texture_position - 1.0) * input.turned_size;
+    color.a *= saturate(0.5 - max(outside.x, outside.y));
+  }
+  return color;
 }
 
 float4 hsla_to_rgba(Hsla hsla) {
@@ -1139,6 +1171,31 @@ float4 distance_from_clip_rect_transformed(float2 unit_vertex, Bounds_ScaledPixe
                 clip_bounds.origin.x + clip_bounds.size.width - transformed_position.x,
                 transformed_position.y - clip_bounds.origin.y,
                 clip_bounds.origin.y + clip_bounds.size.height - transformed_position.y);
+}
+
+// Whether a transformation turns what it's applied to, so its edges no longer run along
+// the pixel grid.
+bool is_turned(TransformationMatrix transformation) {
+  return transformation.rotation_scale[0][1] != 0. ||
+         transformation.rotation_scale[1][0] != 0.;
+}
+
+// A corner of the unit square, moved a pixel further out from the bounds on each side,
+// for a turned quad to have room to smooth its edges.
+float2 outset_unit_vertex(float2 unit_vertex, Bounds_ScaledPixels bounds) {
+  float2 size = float2(bounds.size.width, bounds.size.height);
+  return (unit_vertex * (size + 2.) - 1.) / size;
+}
+
+// Where a point after the transformation was before it: the inverse transformation. Exact
+// for the unit transformation.
+float2 untransformed_position(float2 position, TransformationMatrix transformation) {
+  float a = transformation.rotation_scale[0][0];
+  float b = transformation.rotation_scale[0][1];
+  float c = transformation.rotation_scale[1][0];
+  float d = transformation.rotation_scale[1][1];
+  float2 moved = position - float2(transformation.translation[0], transformation.translation[1]);
+  return float2(d * moved.x - b * moved.y, a * moved.y - c * moved.x) / (a * d - b * c);
 }
 
 float4 over(float4 below, float4 above) {

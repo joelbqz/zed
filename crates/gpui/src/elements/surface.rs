@@ -1,6 +1,6 @@
 use crate::{
     App, Bounds, Element, ElementId, GlobalElementId, InspectorElementId, IntoElement, LayoutId,
-    ObjectFit, Pixels, Style, StyleRefinement, Styled, Window,
+    ObjectFit, Pixels, Style, StyleRefinement, Styled, Transformation, Window,
 };
 #[cfg(target_os = "macos")]
 use core_video::pixel_buffer::CVPixelBuffer;
@@ -25,6 +25,7 @@ impl From<CVPixelBuffer> for SurfaceSource {
 pub struct Surface {
     source: SurfaceSource,
     object_fit: ObjectFit,
+    transformation: Option<Transformation>,
     style: StyleRefinement,
 }
 
@@ -34,6 +35,7 @@ pub fn surface(source: impl Into<SurfaceSource>) -> Surface {
     Surface {
         source: source.into(),
         object_fit: ObjectFit::Contain,
+        transformation: None,
         style: Default::default(),
     }
 }
@@ -42,6 +44,13 @@ impl Surface {
     /// Set the object fit for the image.
     pub fn object_fit(mut self, object_fit: ObjectFit) -> Self {
         self.object_fit = object_fit;
+        self
+    }
+
+    /// Transform the surface with the given transformation, about the center of the element.
+    /// Note that this won't effect the layout of the element, only the rendering.
+    pub fn with_transformation(mut self, transformation: Transformation) -> Self {
+        self.transformation = Some(transformation);
         self
     }
 }
@@ -97,8 +106,14 @@ impl Element for Surface {
             SurfaceSource::Surface(surface) => {
                 let size = crate::size(surface.get_width().into(), surface.get_height().into());
                 let new_bounds = self.object_fit.get_bounds(bounds, size);
+                let transformation = self
+                    .transformation
+                    .map(|transformation| {
+                        transformation.into_matrix(bounds.center(), window.scale_factor())
+                    })
+                    .unwrap_or_default();
                 // TODO: Add support for corner_radii
-                window.paint_surface(new_bounds, surface.clone());
+                window.paint_surface_transformed(new_bounds, surface.clone(), transformation);
             }
             #[allow(unreachable_patterns)]
             _ => {}

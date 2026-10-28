@@ -189,6 +189,29 @@ fn to_tile_position(unit_vertex: vec2<f32>, tile: AtlasTile) -> vec2<f32> {
   return (vec2<f32>(tile.bounds.origin) + unit_vertex * vec2<f32>(tile.bounds.size)) / atlas_size;
 }
 
+// Whether a transformation turns what it's applied to, so its edges no longer run along
+// the pixel grid.
+fn is_turned(transform: TransformationMatrix) -> bool {
+    return transform.rotation_scale[0][1] != 0.0 || transform.rotation_scale[1][0] != 0.0;
+}
+
+// A corner of the unit square, moved a pixel further out from the bounds on each side,
+// for a turned quad to have room to smooth its edges.
+fn outset_unit_vertex(unit_vertex: vec2<f32>, bounds: Bounds) -> vec2<f32> {
+    return (unit_vertex * (bounds.size + 2.0) - 1.0) / bounds.size;
+}
+
+// Where a point after the transformation was before it: the inverse transformation. Exact
+// for the unit transformation.
+fn untransformed_position(position: vec2<f32>, transform: TransformationMatrix) -> vec2<f32> {
+    let m = transpose(transform.rotation_scale);
+    let moved = position - transform.translation;
+    return vec2<f32>(
+        m[1][1] * moved.x - m[1][0] * moved.y,
+        m[0][0] * moved.y - m[0][1] * moved.x,
+    ) / determinant(m);
+}
+
 fn distance_from_clip_rect_impl(position: vec2<f32>, clip_bounds: Bounds) -> vec4<f32> {
     let tl = position - clip_bounds.origin;
     let br = clip_bounds.origin + clip_bounds.size - position;
@@ -1268,6 +1291,7 @@ struct PolychromeSprite {
     content_mask: Bounds,
     corner_radii: Corners,
     tile: AtlasTile,
+    transformation: TransformationMatrix,
 }
 
 
@@ -1280,27 +1304,40 @@ struct PolySpriteVarying {
 
 @vertex
 fn vs_poly_sprite(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) instance_id: u32) -> PolySpriteVarying {
-    let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
+    var unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
     let sprite = load_poly_sprite(instance_id);
+    if (is_turned(sprite.transformation)) {
+        unit_vertex = outset_unit_vertex(unit_vertex, sprite.bounds);
+    }
 
     var out = PolySpriteVarying();
-    out.position = to_device_position(unit_vertex, sprite.bounds);
+    out.position = to_device_position_transformed(unit_vertex, sprite.bounds, sprite.transformation);
     out.tile_position = to_tile_position(unit_vertex, sprite.tile);
     out.sprite_id = instance_id;
-    out.clip_distances = distance_from_clip_rect(unit_vertex, sprite.bounds, sprite.content_mask);
+    out.clip_distances = distance_from_clip_rect_transformed(unit_vertex, sprite.bounds, sprite.content_mask, sprite.transformation);
     return out;
 }
 
 @fragment
 fn fs_poly_sprite(input: PolySpriteVarying) -> @location(0) vec4<f32> {
-    let sample = textureSample(t_sprite, s_sprite, input.tile_position);
+    let sprite = load_poly_sprite(input.sprite_id);
+    // A turned sprite's quad reaches past its tile, and past the tile's edge texels lie its
+    // neighbors in the atlas.
+    let atlas_size = vec2<f32>(textureDimensions(t_sprite, 0));
+    let tile_origin = vec2<f32>(sprite.tile.bounds.origin);
+    let tile_size = vec2<f32>(sprite.tile.bounds.size);
+    let clamped = clamp(input.tile_position, (tile_origin + 0.5) / atlas_size,
+                        (tile_origin + tile_size - 0.5) / atlas_size);
+    let tile_position = select(input.tile_position, clamped, is_turned(sprite.transformation));
+    let sample = textureSample(t_sprite, s_sprite, tile_position);
     // Alpha clip after using the derivatives.
     if (any(input.clip_distances < vec4<f32>(0.0))) {
         return vec4<f32>(0.0);
     }
 
-    let sprite = load_poly_sprite(input.sprite_id);
-    let distance = quad_sdf(input.position.xy, sprite.bounds, sprite.corner_radii);
+    // Corners are rounded in the sprite's own space, before it's transformed.
+    let position = untransformed_position(input.position.xy, sprite.transformation);
+    let distance = quad_sdf(position, sprite.bounds, sprite.corner_radii);
 
     var color = sample;
     if (sprite.grayscale != 0u) {

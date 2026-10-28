@@ -4791,6 +4791,7 @@ impl Window {
                 content_mask,
                 tile,
                 opacity,
+                transformation: TransformationMatrix::unit(),
             });
         }
         Ok(())
@@ -4877,6 +4878,34 @@ impl Window {
         data: Arc<RenderImage>,
         frame_index: usize,
         grayscale: bool,
+    ) -> Result<()> {
+        self.paint_image_transformed(
+            bounds,
+            image_bounds,
+            corner_radii,
+            data,
+            frame_index,
+            grayscale,
+            TransformationMatrix::unit(),
+        )
+    }
+
+    /// Paint an image into the scene for the next frame at the current z-index, transformed
+    /// (in scaled pixels) as a monochrome sprite is by [`Window::paint_svg`]. Clipping by the
+    /// content mask happens after the transformation, rounding of the corners before it.
+    ///
+    /// This method will panic if the frame_index is not valid
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn paint_image_transformed(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        image_bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        data: Arc<RenderImage>,
+        frame_index: usize,
+        grayscale: bool,
+        transformation: TransformationMatrix,
     ) -> Result<()> {
         self.invalidator.debug_assert_paint();
 
@@ -4973,6 +5002,7 @@ impl Window {
             corner_radii,
             tile: sub_tile,
             opacity,
+            transformation,
         });
         Ok(())
     }
@@ -4982,6 +5012,20 @@ impl Window {
     /// This method should only be called as part of the paint phase of element drawing.
     #[cfg(target_os = "macos")]
     pub fn paint_surface(&mut self, bounds: Bounds<Pixels>, image_buffer: CVPixelBuffer) {
+        self.paint_surface_transformed(bounds, image_buffer, TransformationMatrix::unit());
+    }
+
+    /// Paint a surface into the scene for the next frame at the current z-index, transformed
+    /// (in scaled pixels) as a monochrome sprite is by [`Window::paint_svg`].
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    #[cfg(target_os = "macos")]
+    pub fn paint_surface_transformed(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        image_buffer: CVPixelBuffer,
+        transformation: TransformationMatrix,
+    ) {
         use crate::PaintSurface;
 
         self.invalidator.debug_assert_paint();
@@ -4992,6 +5036,7 @@ impl Window {
             order: 0,
             bounds,
             content_mask,
+            transformation,
             image_buffer,
         });
     }
