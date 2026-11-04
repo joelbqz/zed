@@ -2677,6 +2677,17 @@ extern "C" fn handle_key_event(this: &Object, native_event: id, key_equivalent: 
 
             drop(lock);
 
+            // A native view the app put in the window (a web view, a text field) has the
+            // keyboard. AppKit still offers this view the keys it treats as key equivalents
+            // (those with Control or a function key, such as the arrows), since it's the
+            // content view. The app's bindings and key listeners get them as usual, but text
+            // input is the first responder's own: handing them to this view's input context
+            // would type them into it, the arrows as private-use characters. Unhandled, they
+            // go back to AppKit, which delivers them to the first responder.
+            if !is_first_responder(this) {
+                return run_callback(PlatformInput::KeyDown(key_down_event));
+            }
+
             let is_composing =
                 with_input_handler(this, |input_handler| input_handler.marked_text_range())
                     .flatten()
@@ -3722,6 +3733,19 @@ fn send_file_drop_event(
 fn drag_event_position(window_state: &Mutex<MacWindowState>, dragging_info: id) -> Point<Pixels> {
     let drag_location: NSPoint = unsafe { msg_send![dragging_info, draggingLocation] };
     convert_mouse_position(drag_location, window_state.lock().content_size().height)
+}
+
+/// Whether `view` is its window's first responder, so keys typed are meant for it rather than
+/// for a native subview that took the keyboard.
+fn is_first_responder(view: &Object) -> bool {
+    unsafe {
+        let window: id = msg_send![view, window];
+        if window.is_null() {
+            return false;
+        }
+        let responder: id = msg_send![window, firstResponder];
+        std::ptr::eq(responder as *const Object, view as *const Object)
+    }
 }
 
 fn with_input_handler<F, R>(window: &Object, f: F) -> Option<R>
