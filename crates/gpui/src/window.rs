@@ -238,6 +238,10 @@ impl WindowInvalidator {
         }
     }
 
+    pub fn phase(&self) -> DrawPhase {
+        self.inner.borrow().draw_phase
+    }
+
     pub fn set_phase(&self, phase: DrawPhase) {
         self.inner.borrow_mut().draw_phase = phase
     }
@@ -2697,6 +2701,84 @@ impl Window {
     /// Returns the bounds of the current window in the global coordinate space, which could span across multiple displays.
     pub fn bounds(&self) -> Bounds<Pixels> {
         self.platform_window.bounds()
+    }
+
+    /// Draws an element on its own into an image, offscreen. `build` makes the element; it's
+    /// laid out in `size` and painted at the window's scale factor, at the image's top-left,
+    /// into a scene of its own, which the GPU renders with the window's sprite atlas into an
+    /// image `size` times the scale factor device pixels large. Where it draws nothing, the
+    /// image is transparent.
+    ///
+    /// Nothing the element registers while it's drawn reaches the window's frames: its
+    /// hitboxes, mouse and key listeners, input handlers, cursor styles, tooltips, deferred
+    /// draws and element state are let go of with its scene, and nothing is presented. It
+    /// can be called between frames, or while one is drawn (from an element's prepaint or
+    /// paint, or a view's render). Rendering waits for the GPU, so it takes about as long as
+    /// drawing the element on screen, and a little more.
+    pub fn render_element_to_image(
+        &mut self,
+        size: Size<Pixels>,
+        cx: &mut App,
+        build: impl FnOnce(&mut Window, &mut App) -> AnyElement,
+    ) -> anyhow::Result<Arc<RenderImage>> {
+        let scale_factor = self.scale_factor();
+        let device_size = size.map(|length| DevicePixels((length.0 * scale_factor).ceil() as i32));
+        if device_size.width.0 <= 0 || device_size.height.0 <= 0 {
+            anyhow::bail!("nothing to render: {size:?}");
+        }
+
+        // A frame of its own, with nothing pushed yet, in place of the one being drawn (or the
+        // next one, between frames), to put back once it's painted.
+        let arena_scope = ElementArenaScope::enter(&cx.element_arena);
+        let phase = self.invalidator.phase();
+        let frame = mem::replace(
+            &mut self.next_frame,
+            Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
+        );
+        let element_ids = mem::replace(
+            &mut self.element_id_stack,
+            SmallVec::from_elem(ElementId::Name("render_element_to_image".into()), 1),
+        );
+        let text_styles = mem::take(&mut self.text_style_stack);
+        let offsets = mem::take(&mut self.element_offset_stack);
+        // Clipped to the image, not the window, which it may be bigger than.
+        let masks = mem::replace(
+            &mut self.content_mask_stack,
+            vec![ContentMask {
+                bounds: Bounds::new(Point::default(), size),
+            }],
+        );
+        let opacity = mem::replace(&mut self.element_opacity, 1.0);
+
+        self.invalidator.set_phase(DrawPhase::Prepaint);
+        let mut element = build(self, cx);
+        element.prepaint_as_root(Point::default(), size.into(), self, cx);
+        self.invalidator.set_phase(DrawPhase::Paint);
+        element.paint(self, cx);
+        drop(element);
+        let mut scene = mem::take(&mut self.next_frame.scene);
+        scene.finish();
+
+        self.next_frame = frame;
+        self.element_id_stack = element_ids;
+        self.text_style_stack = text_styles;
+        self.element_offset_stack = offsets;
+        self.content_mask_stack = masks;
+        self.element_opacity = opacity;
+        self.invalidator.set_phase(phase);
+        arena_scope.exit(&cx.element_arena).clear(cx);
+
+        let mut pixels = self
+            .platform_window
+            .render_scene_offscreen(&scene, device_size)?;
+        // Images are drawn from BGRA.
+        for pixel in pixels.chunks_exact_mut(4) {
+            pixel.swap(0, 2);
+        }
+        Ok(Arc::new(RenderImage::new(SmallVec::from_elem(
+            image::Frame::new(pixels),
+            1,
+        ))))
     }
 
     /// Renders the current frame's scene to a texture and returns the pixel data as an RGBA image.
@@ -7959,6 +8041,54 @@ mod tests {
     /// rely on the frame waker firing whenever frame demand arises; a demand
     /// source that skips the waker shows up there as a window that silently
     /// stops repainting until unrelated activity wakes it.
+    /// An element drawn into an image is laid out at the image's top-left, in its size, and
+    /// nothing it registers reaches the window's frame.
+    #[gpui::test]
+    fn test_render_element_to_image_leaves_the_frame_alone(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| EmptyView);
+        window
+            .update(cx, |_, window, cx| {
+                let frame = |window: &Window| {
+                    (
+                        window.next_frame.mouse_listeners.len(),
+                        window.next_frame.hitboxes.len(),
+                        window.next_frame.scene.quads.len(),
+                    )
+                };
+                let before = frame(window);
+                let painted = Rc::new(Cell::new(None));
+                let result = window.render_element_to_image(size(px(40.), px(30.)), cx, {
+                    let painted = painted.clone();
+                    move |_, _| {
+                        div()
+                            .id("drawn alone")
+                            .size_full()
+                            .bg(hsla(0., 1., 0.5, 1.))
+                            .on_mouse_down(MouseButton::Left, |_, _, _| {})
+                            .child(
+                                canvas(
+                                    |_, _, _| {},
+                                    move |bounds, _, window, _| {
+                                        painted.set(Some((bounds, window.content_mask().bounds)));
+                                    },
+                                )
+                                .size_full(),
+                            )
+                            .into_any_element()
+                    }
+                });
+                let bounds = Bounds::new(Point::default(), size(px(40.), px(30.)));
+                assert_eq!(painted.get(), Some((bounds, bounds)));
+                // The test platform has no GPU to render it with.
+                assert!(result.is_err());
+                assert_eq!(frame(window), before);
+                assert!(window.invalidator.not_drawing());
+                assert!(window.content_mask_stack.is_empty());
+                assert!(window.element_offset_stack.is_empty());
+            })
+            .unwrap();
+    }
+
     #[gpui::test]
     fn test_frame_waker_fires_on_frame_demand(cx: &mut TestAppContext) {
         let window = cx.add_window(|_, _| EmptyView);

@@ -50,7 +50,6 @@ use anyhow::{Context as _, Result};
 use async_task::Runnable;
 use collections::FxHashMap;
 use futures::channel::oneshot;
-#[cfg(any(test, feature = "test-support", feature = "bench-support"))]
 use image::RgbaImage;
 use image::codecs::gif::GifDecoder;
 use image::{AnimationDecoder as _, DynamicImage, Frame};
@@ -1078,6 +1077,17 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     #[cfg(any(test, feature = "test-support", feature = "bench-support"))]
     fn as_test(&mut self) -> Option<&mut TestWindow> {
         None
+    }
+
+    /// Renders `scene` into a texture of its own, `size` device pixels large, with the
+    /// window's sprite atlas, and returns its pixels, without presenting anything or changing
+    /// how the window's own frames are drawn. See [`Window::render_element_to_image`].
+    fn render_scene_offscreen(
+        &self,
+        _scene: &Scene,
+        _size: Size<DevicePixels>,
+    ) -> Result<RgbaImage> {
+        anyhow::bail!("render_scene_offscreen not implemented for this platform")
     }
 
     /// Renders the given scene to a texture and returns the pixel data as an RGBA image.

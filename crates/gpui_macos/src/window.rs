@@ -32,7 +32,6 @@ use gpui::{
     WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowKind,
     WindowParams, WindowVisibility, point, px, size,
 };
-#[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
 
 use core_foundation::base::{CFRelease, CFTypeRef};
@@ -2352,6 +2351,14 @@ impl PlatformWindow for MacWindow {
 
     fn play_system_bell(&self) {
         NSBeep()
+    }
+
+    fn render_scene_offscreen(
+        &self,
+        scene: &gpui::Scene,
+        size: Size<gpui::DevicePixels>,
+    ) -> anyhow::Result<RgbaImage> {
+        self.0.lock().renderer.render_scene_offscreen(scene, size)
     }
 
     #[cfg(any(test, feature = "test-support"))]

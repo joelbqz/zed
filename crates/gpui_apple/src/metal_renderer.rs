@@ -10,7 +10,6 @@ use gpui::{
     AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, PaintSurface, Path, Point,
     PrimitiveBatch, ScaledPixels, Scene, Size, TransformationMatrix, point, size,
 };
-#[cfg(any(test, feature = "bench-support", feature = "test-support"))]
 use image::RgbaImage;
 use objc2::runtime::AnyObject;
 
@@ -562,6 +561,57 @@ impl MetalRenderer {
         command_buffer.wait_until_completed();
 
         read_texture_to_image(drawable.texture())
+    }
+
+    /// Renders `scene` into a texture of its own, `size` device pixels large, and reads it
+    /// back, without presenting anything: a picture of part of a window, drawn with the
+    /// window's atlas, as its frames are. The window's next frame is drawn as it would have
+    /// been.
+    pub fn render_scene_offscreen(
+        &mut self,
+        scene: &Scene,
+        size: Size<DevicePixels>,
+    ) -> Result<RgbaImage> {
+        if size.width.0 <= 0 || size.height.0 <= 0 {
+            anyhow::bail!("Invalid size for render_scene_offscreen: {:?}", size);
+        }
+        objc2::rc::autoreleasepool(|_| {
+            // Paths are drawn through textures the size of what's drawn to: this picture's for
+            // now, then the window's again.
+            let window_textures = (
+                self.path_intermediate_texture.take(),
+                self.path_intermediate_msaa_texture.take(),
+            );
+            if !scene.paths.is_empty() {
+                self.update_path_intermediate_textures(size);
+            }
+
+            let texture_descriptor = metal::TextureDescriptor::new();
+            texture_descriptor.set_width(size.width.0 as u64);
+            texture_descriptor.set_height(size.height.0 as u64);
+            texture_descriptor.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+            texture_descriptor.set_usage(
+                metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead,
+            );
+            texture_descriptor.set_storage_mode(metal::MTLStorageMode::Managed);
+            let target_texture = self.device.new_texture(&texture_descriptor);
+
+            let rendered = self.render_frame(scene, &target_texture, size);
+            (
+                self.path_intermediate_texture,
+                self.path_intermediate_msaa_texture,
+            ) = window_textures;
+            let command_buffer = rendered?;
+            if !self.is_unified_memory {
+                let blit = command_buffer.new_blit_command_encoder();
+                blit.synchronize_resource(&target_texture);
+                blit.end_encoding();
+            }
+            command_buffer.commit();
+            command_buffer.wait_until_completed();
+
+            read_texture_to_image(&target_texture)
+        })
     }
 
     /// Renders a scene to an image without requiring a window or CAMetalLayer.
@@ -1250,7 +1300,6 @@ fn new_command_encoder_for_texture<'a>(
     command_encoder
 }
 
-#[cfg(any(test, feature = "bench-support", feature = "test-support"))]
 fn read_texture_to_image(texture: &metal::TextureRef) -> Result<RgbaImage> {
     let width = texture.width() as u32;
     let height = texture.height() as u32;
