@@ -221,6 +221,17 @@ impl A11y {
         self.active_this_frame
     }
 
+    /// Stops elements adding to this frame's tree until [`Self::resume`], given what this
+    /// returns: for drawing elements that aren't part of the window.
+    pub(crate) fn pause(&mut self) -> bool {
+        std::mem::replace(&mut self.active_this_frame, false)
+    }
+
+    /// Lets elements add to this frame's tree again, if they could before [`Self::pause`].
+    pub(crate) fn resume(&mut self, active: bool) {
+        self.active_this_frame = active;
+    }
+
     pub(crate) fn set_focusable(&mut self, node_id: NodeId, focus_id: FocusId) {
         self.focus_ids.insert(node_id, focus_id);
     }

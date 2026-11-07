@@ -2709,14 +2709,20 @@ impl Window {
     /// image `size` times the scale factor device pixels large. Where it draws nothing, the
     /// image is transparent.
     ///
+    /// It's drawn as part of `view`, which needn't be one of the window's: what the element
+    /// asks for that isn't ready yet (an image or other asset still loading, a timer, an
+    /// animation frame) notifies `view` when it is, the way it would the view an element on
+    /// screen is drawn in, so observing `view` says when drawing it again would draw more.
+    ///
     /// Nothing the element registers while it's drawn reaches the window's frames: its
     /// hitboxes, mouse and key listeners, input handlers, cursor styles, tooltips, deferred
-    /// draws and element state are let go of with its scene, and nothing is presented. It
-    /// can be called between frames, or while one is drawn (from an element's prepaint or
-    /// paint, or a view's render). Rendering waits for the GPU, so it takes about as long as
-    /// drawing the element on screen, and a little more.
+    /// draws, accessibility nodes and element state are let go of with its scene, and
+    /// nothing is presented. It can be called between frames, or while one is drawn (from an
+    /// element's prepaint or paint, or a view's render). Rendering waits for the GPU, so it
+    /// takes about as long as drawing the element on screen, and a little more.
     pub fn render_element_to_image(
         &mut self,
+        view: EntityId,
         size: Size<Pixels>,
         cx: &mut App,
         build: impl FnOnce(&mut Window, &mut App) -> AnyElement,
@@ -2749,13 +2755,16 @@ impl Window {
             }],
         );
         let opacity = mem::replace(&mut self.element_opacity, 1.0);
+        // Its nodes would land in the tree the frame being drawn is building.
+        let a11y = self.a11y.pause();
 
-        self.invalidator.set_phase(DrawPhase::Prepaint);
-        let mut element = build(self, cx);
-        element.prepaint_as_root(Point::default(), size.into(), self, cx);
-        self.invalidator.set_phase(DrawPhase::Paint);
-        element.paint(self, cx);
-        drop(element);
+        self.with_rendered_view(view, |window| {
+            window.invalidator.set_phase(DrawPhase::Prepaint);
+            let mut element = build(window, cx);
+            element.prepaint_as_root(Point::default(), size.into(), window, cx);
+            window.invalidator.set_phase(DrawPhase::Paint);
+            element.paint(window, cx);
+        });
         let mut scene = mem::take(&mut self.next_frame.scene);
         scene.finish();
 
@@ -2765,6 +2774,7 @@ impl Window {
         self.element_offset_stack = offsets;
         self.content_mask_stack = masks;
         self.element_opacity = opacity;
+        self.a11y.resume(a11y);
         self.invalidator.set_phase(phase);
         arena_scope.exit(&cx.element_arena).clear(cx);
 
@@ -8057,7 +8067,8 @@ mod tests {
                 };
                 let before = frame(window);
                 let painted = Rc::new(Cell::new(None));
-                let result = window.render_element_to_image(size(px(40.), px(30.)), cx, {
+                let view = cx.new(|_| ()).entity_id();
+                let result = window.render_element_to_image(view, size(px(40.), px(30.)), cx, {
                     let painted = painted.clone();
                     move |_, _| {
                         div()
@@ -8087,6 +8098,56 @@ mod tests {
                 assert!(window.element_offset_stack.is_empty());
             })
             .unwrap();
+    }
+
+    #[gpui::test]
+    fn test_render_element_to_image_draws_as_part_of_the_view_given(cx: &mut TestAppContext) {
+        // Drawn between frames, an element that asks which view it's in (as images, hover
+        // styles and animations do) is told the one given, which hears when what it waited
+        // on is ready; and with accessibility on, it adds nothing to the window's tree.
+        let window = cx.add_window(|_, _| EmptyView);
+        let view = cx.new(|_| ());
+        let notified = Rc::new(Cell::new(0));
+        let _observing = cx.update(|cx| {
+            let notified = notified.clone();
+            cx.observe(&view, move |_, _| notified.set(notified.get() + 1))
+        });
+        window
+            .update(cx, |_, window, cx| {
+                window.a11y.resume(true);
+                let nodes = window.a11y.node_bounds.len();
+                let seen = Rc::new(Cell::new(None));
+                let _ =
+                    window.render_element_to_image(view.entity_id(), size(px(40.), px(30.)), cx, {
+                        let seen = seen.clone();
+                        move |_, _| {
+                            div()
+                                .id("a button")
+                                .role(accesskit::Role::Button)
+                                .size_full()
+                                .child(
+                                    canvas(
+                                        move |_, window, _| {
+                                            seen.set(Some(window.current_view()));
+                                            window.request_animation_frame();
+                                        },
+                                        |_, _, _, _| {},
+                                    )
+                                    .size_full(),
+                                )
+                                .into_any_element()
+                        }
+                    });
+                assert_eq!(seen.get(), Some(view.entity_id()));
+                assert!(window.a11y.is_active());
+                assert_eq!(window.a11y.node_bounds.len(), nodes);
+                assert!(window.rendered_entity_stack.is_empty());
+                window.a11y.resume(false);
+                window.simulate_next_frame(cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(notified.get(), 1);
     }
 
     #[gpui::test]
